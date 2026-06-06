@@ -1,4 +1,4 @@
-TOKET = ''
+﻿TOKET = ''
 TOBRUT = ''
 
 from IPython.core.magic import register_line_magic
@@ -9,6 +9,9 @@ from pathlib import Path
 from tqdm import tqdm
 import subprocess
 import threading
+import concurrent.futures
+import shutil
+import tempfile
 import requests
 import zipfile
 import shlex
@@ -72,6 +75,108 @@ def say(line):
 
     display(HTML(' '.join(output)))
 
+
+def _truthy(value):
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on', 'parallel'}
+
+def _safe_int(value, default, minimum=1, maximum=16):
+    try:
+        parsed = int(value)
+        return max(minimum, min(maximum, parsed))
+    except Exception:
+        return default
+
+def _parse_download_options(parts):
+    clean, opts = [], {'parallel': False, 'workers': 3, 'connections': 16}
+    skip = False
+    for idx, part in enumerate(parts):
+        if skip:
+            skip = False
+            continue
+        if part in {'--parallel', '-P'}:
+            opts['parallel'] = True
+        elif part.startswith('--parallel='):
+            opts['parallel'] = _truthy(part.split('=', 1)[1])
+        elif part in {'--workers', '--max-workers', '-j'} and idx + 1 < len(parts):
+            opts['workers'] = _safe_int(parts[idx + 1], opts['workers'], 1, 10)
+            skip = True
+        elif part.startswith('--workers=') or part.startswith('--max-workers='):
+            opts['workers'] = _safe_int(part.split('=', 1)[1], opts['workers'], 1, 10)
+        elif part.startswith('--connections='):
+            opts['connections'] = _safe_int(part.split('=', 1)[1], opts['connections'], 1, 16)
+        else:
+            clean.append(part)
+    return clean, opts
+
+def _download_target(line):
+    parts = line.strip().split()
+    if not parts:
+        return None
+    url = parts[0].replace('\\', '')
+    target_dir = Path.cwd()
+    filename = None
+    if len(parts) >= 3:
+        a, b = parts[1], parts[2]
+        a_path = '/' in a or '~/' in a
+        b_path = '/' in b or '~/' in b
+        if b_path and not a_path:
+            target_dir, filename = Path(b).expanduser(), a
+        elif a_path and not b_path:
+            target_dir, filename = Path(a).expanduser(), b
+        elif Path(b).suffix == '' and Path(a).suffix != '':
+            target_dir, filename = Path(b).expanduser(), a
+        else:
+            target_dir, filename = Path(a).expanduser(), b
+    elif len(parts) == 2:
+        a = parts[1]
+        if '/' in a or '~/' in a:
+            target_dir = Path(a).expanduser()
+        else:
+            filename = a
+    if not filename:
+        filename = Path(urlparse(url).path).name or 'download.bin'
+    return url, target_dir, filename
+
+def parallel_download(lines, max_workers=3, connections=16):
+    entries = []
+    for line in lines:
+        target = _download_target(line)
+        if not target:
+            continue
+        url, target_dir, filename = target
+        url, _, _, filename = get_url(url, filename)
+        if not url:
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        entries.append((url, target_dir, filename))
+    if not entries:
+        print('  missing URL, downloading nothing')
+        return
+    if not shutil.which('aria2c'):
+        print('  aria2c not found; falling back to sequential download')
+        for line in lines:
+            netorare(line)
+        return
+    queue = Path('/tmp/aria2_queue.txt')
+    with queue.open('w', encoding='utf-8') as handle:
+        for url, target_dir, filename in entries:
+            handle.write(f'{url}\n')
+            handle.write(f'  dir={target_dir}\n')
+            handle.write(f'  out={filename}\n')
+            handle.write('  continue=true\n')
+            handle.write('  allow-overwrite=true\n')
+            if TOBRUT and 'huggingface.co' in url:
+                handle.write(f'  header=Authorization: Bearer {TOBRUT}\n')
+    cmd = [
+        'aria2c', '-i', str(queue),
+        '--console-log-level=notice', '--summary-interval=1',
+        '--max-concurrent-downloads', str(max_workers),
+        '--split', str(connections),
+        '--max-connection-per-server', str(connections),
+        '--min-split-size=1M', '--continue=true'
+    ]
+    print(f'  Parallel download: {len(entries)} file(s), workers={max_workers}, connections={connections}')
+    subprocess.run(cmd, check=False)
 @register_line_magic
 def download(i):
     args = i.split()
@@ -431,12 +536,12 @@ def ariari(url, fp, fn):
 
                         r = (
                             f'{fn} '
-                            #f'{MAGENTA}【{RESET}'
+                            #f'{MAGENTA}ã€{RESET}'
                             f'{body}'
-                            #f'{MAGENTA}】{RESET}'
+                            #f'{MAGENTA}ã€‘{RESET}'
                         )
 
-                        print(f"\r{' '*300}\r  {RED}●{RESET} {r}", end='')
+                        print(f"\r{' '*300}\r  {RED}â—{RESET} {r}", end='')
                         sys.stdout.flush()
 
                         bl = True
@@ -453,7 +558,7 @@ def ariari(url, fp, fn):
                 if len(pipe) >= 4:
                     saved = pipe[3]
                     saved = re.sub(r'/', f'{ORANGE}/{RESET}', saved)
-                    print(f"\r{' '*300}\r  {GREEN}●{RESET} {saved}")
+                    print(f"\r{' '*300}\r  {GREEN}â—{RESET} {saved}")
                     sys.stdout.flush()
                     bl = False
 
@@ -484,8 +589,8 @@ def curlly(cmd, fn):
 
         with tqdm(
             total=100, desc=f'{fn.ljust(58):>{58 + 2}}', initial=0,
-            bar_format='{desc} 【{bar:20}】【{percentage:3.0f}%】',
-            ascii='▷▶', file=sys.stdout
+            bar_format='{desc} ã€{bar:20}ã€‘ã€{percentage:3.0f}%ã€‘',
+            ascii='â–·â–¶', file=sys.stdout
         ) as pbar:
             for line in iter(p.stderr.readline, ''):
                 if line.strip():
@@ -571,7 +676,7 @@ def gdrown(url, fp=None, fn=None):
             if '%' in prog and '/' in prog:
                 prog = re.sub(r'(\d+)(%)', f'\\1{PURPLE}\\2{RESET}', prog)
                 prog = re.sub(r'(\d+(?:\.\d+)?[KMG]B/s)', f'{CYAN}\\1{RESET}', prog)
-                print(f"\r{' '*300}\r  {RED}●{RESET} {name} {prog}", end='')
+                print(f"\r{' '*300}\r  {RED}â—{RESET} {name} {prog}", end='')
 
                 sys.stdout.flush()
                 bl = True
@@ -586,14 +691,14 @@ def gdrown(url, fp=None, fn=None):
                 if skip: continue
                 if bl: print()
 
-                print(f'  {GREEN}●{RESET} {prog}')
+                print(f'  {GREEN}â—{RESET} {prog}')
                 bl = False
 
         p.wait()
 
         if saved:
             saved = re.sub(r'/', f'{ORANGE}/{RESET}', saved)
-            print(f"\r{' '*300}\r  {GREEN}●{RESET} {saved}")
+            print(f"\r{' '*300}\r  {GREEN}â—{RESET} {saved}")
 
     except KeyboardInterrupt:
         try: p.terminate()
@@ -602,307 +707,70 @@ def gdrown(url, fp=None, fn=None):
 
 @register_line_magic
 def clone(i):
-    import concurrent.futures
     p = Path(i).expanduser()
 
     def proc(line):
-        line = line.strip()
-        if line.startswith('git clone'):
-            line = line[len('git clone '):].strip()
-        return line
+        return line.strip()[len('git clone '):].strip() if line.strip().startswith('git clone') else line.strip()
+
+    def normalize(line):
+        raw = proc(line)
+        if not raw:
+            return None
+        parts = shlex.split(raw)
+        if '--depth' not in parts and not any(part.startswith('--depth=') for part in parts):
+            parts = ['--depth', '1'] + parts
+        if '--recurse-submodules' not in parts:
+            parts = ['--recurse-submodules'] + parts
+        return ['git', 'clone'] + parts
+
+    def run_clone(cmd_list):
+        url = next((repo for repo in cmd_list if re.match(r'https?://', repo)), None)
+        dest = None
+        if len(cmd_list) >= 4 and not cmd_list[-1].startswith('-') and not re.match(r'https?://', cmd_list[-1]):
+            dest = Path(cmd_list[-1]).expanduser()
+        if dest and dest.exists():
+            print(f'  skip existing ▶ {dest}')
+            return 0
+        p = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        while True:
+            output = p.stdout.readline()
+            if not output and p.poll() is not None:
+                break
+            if output := output.strip():
+                if 'fatal' in output.lower() or 'error' in output.lower():
+                    print(f'  {output}')
+                elif output.startswith('Cloning into'):
+                    try:
+                        repo_name = "/".join(output.split("'")[1].split("/")[-3:])
+                    except Exception:
+                        repo_name = output
+                    print(f'  {repo_name} ▶ {url}')
+        p.wait()
+        return p.returncode
 
     if p.suffix == '.txt' and p.is_file():
-        urls = [proc(line) for line in p.read_text().splitlines() if line.strip()]
+        raw_lines = [line for line in p.read_text().splitlines() if line.strip()]
     elif isinstance(i, str):
-        urls = [proc(i)] if i.strip() else []
+        raw_lines = [i]
     else:
-        urls = [proc(l) for l in i if l.strip()]
+        raw_lines = list(i)
 
-    def clone_one(url_or_cmd):
-        tokens = shlex.split(url_or_cmd)
-        url = next((t for t in tokens if t.startswith('http://') or t.startswith('https://')), None)
-        if not url:
-            return
-        
-        other_args = [t for t in tokens if t != url and not t.startswith('-')]
-        target_name = other_args[0] if other_args else ""
-        
-        cmd = ['git', 'clone', '--depth', '1', '--recurse-submodules', url]
-        if target_name:
-            cmd.append(target_name)
-            
-        repo_display = target_name if target_name else url.split('/')[-1].replace('.git', '')
-        print(f"  [SMFactory] Cloning {repo_display}...")
-        
-        proc_git = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        output, _ = proc_git.communicate()
-        if proc_git.returncode == 0:
-            print(f"  {GREEN}✓{RESET} {repo_display} cloned successfully.")
-        else:
-            print(f"  {RED}✗{RESET} {repo_display} clone failed: {output.strip()}")
-
-    if urls:
-        print(f"[SMFactory] Cloning {len(urls)} repositories in parallel (Max Workers: 5)...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            executor.map(clone_one, urls)
-
-def download_list(downloads, load_from_drive=False, parallel=False, max_workers=3):
-    import threading
-    import shutil
-    cwd = Path.cwd()
-    resolved_downloads = []
-    
-    gdrive_mounted = Path('/content/drive/MyDrive').exists()
-    
-    def get_drive_path(local_path):
-        local_path = Path(local_path).resolve()
-        d_base = Path('/content/drive/MyDrive/SMFactory')
-        p_str = str(local_path).lower()
-        if 'ckpt' in p_str or 'stable-diffusion' in p_str:
-            return d_base / 'checkpoint'
-        elif 'lora' in p_str:
-            return d_base / 'lora'
-        elif 'vae' in p_str:
-            return d_base / 'vae'
-        elif 'embeddings' in p_str:
-            return d_base / 'embeddings'
-        elif 'extensions' in p_str or 'custom_nodes' in p_str:
-            return d_base / 'extensions'
-        elif 'upscale' in p_str or 'esrgan' in p_str:
-            return d_base / 'upscalers'
-        elif 'unet' in p_str:
-            return d_base / 'flux_unet'
-        elif 'clip' in p_str or 'text_encoder' in p_str:
-            return d_base / 'flux_clip'
-        else:
-            return d_base / local_path.name
-
-    for url_line, local_dir in downloads:
-        url_line = url_line.strip()
-        if not url_line:
-            continue
-        
-        parts = url_line.split()
-        url = parts[0].replace('\\', '')
-        fn = parts[1] if len(parts) > 1 else None
-        
-        resolved_url, j, versionId, fn = get_url(url, fn)
-        if not resolved_url:
-            continue
-            
-        local_dir = Path(local_dir).expanduser()
-        local_dir.mkdir(parents=True, exist_ok=True)
-        
-        if not fn:
-            fn = Path(urlparse(resolved_url).path).name
-            if not fn:
-                fn = "downloaded_file"
-                
-        local_file = local_dir / fn
-        drive_dir = None
-        drive_file = None
-        skip = False
-        
-        if load_from_drive and gdrive_mounted:
-            drive_dir = get_drive_path(local_dir)
-            drive_dir.mkdir(parents=True, exist_ok=True)
-            drive_file = drive_dir / fn
-            
-            if drive_file.exists():
-                print(f"[SMFactory] File found in Google Drive: {fn}. Skipping download.")
-                if local_file.exists() or local_file.is_symlink():
-                    try:
-                        if local_file.is_symlink() or local_file.is_file():
-                            local_file.unlink()
-                        elif local_file.is_dir():
-                            shutil.rmtree(local_file)
-                    except Exception:
-                        pass
-                try:
-                    local_file.symlink_to(drive_file)
-                except Exception as e:
-                    print(f"Error creating symlink: {e}")
-                
-                stem = Path(fn).stem
-                for ext in ['.json', '.preview.png']:
-                    sidecar_drive = drive_dir / f"{stem}{ext}"
-                    sidecar_local = local_dir / f"{stem}{ext}"
-                    if sidecar_drive.exists():
-                        if sidecar_local.exists() or sidecar_local.is_symlink():
-                            try:
-                                sidecar_local.unlink()
-                            except Exception:
-                                pass
-                        try:
-                            sidecar_local.symlink_to(sidecar_drive)
-                        except Exception:
-                            pass
-                skip = True
-        
-        resolved_downloads.append({
-            'original_url_line': url_line,
-            'url': resolved_url,
-            'local_dir': local_dir,
-            'filename': fn,
-            'drive_dir': drive_dir,
-            'drive_file': drive_file,
-            'local_file': local_file,
-            'skip': skip,
-            'j': j,
-            'versionId': versionId
-        })
-        
-    to_download = [d for d in resolved_downloads if not d['skip']]
-    if not to_download:
-        print("[SMFactory] All files are already loaded or skipped.")
+    cmds = [cmd for cmd in (normalize(line) for line in raw_lines) if cmd]
+    if not cmds:
         return
-        
-    if not parallel:
-        for d in to_download:
-            print(f"[SMFactory] Downloading sequentially: {d['filename']}")
-            target_dir = d['drive_dir'] if (load_from_drive and gdrive_mounted) else d['local_dir']
-            os.chdir(target_dir)
-            try:
-                ariari(d['url'], target_dir, d['filename'])
-                if load_from_drive and gdrive_mounted:
-                    if d['local_file'].exists() or d['local_file'].is_symlink():
-                        try:
-                            d['local_file'].unlink()
-                        except Exception:
-                            pass
-                    d['local_file'].symlink_to(d['drive_file'])
-                    
-                    stem = Path(d['filename']).stem
-                    for ext in ['.json', '.preview.png']:
-                        side_drive = d['drive_dir'] / f"{stem}{ext}"
-                        side_local = d['local_dir'] / f"{stem}{ext}"
-                        if side_drive.exists():
-                            if side_local.exists() or side_local.is_symlink():
-                                try:
-                                    side_local.unlink()
-                                except Exception:
-                                    pass
-                            try:
-                                side_local.symlink_to(side_drive)
-                            except Exception:
-                                pass
-            finally:
-                os.chdir(cwd)
-    else:
-        queue_file = Path('/tmp/aria2_queue.txt')
-        queue_content = []
-        
-        for d in to_download:
-            target_dir = d['drive_dir'] if (load_from_drive and gdrive_mounted) else d['local_dir']
-            civitai = get_civdom(d['url'])
-            ua = civitai_headers()['User-Agent'] if civitai else 'Mozilla/5.0'
-            
-            queue_content.append(f"{d['url']}")
-            queue_content.append(f"  dir={target_dir}")
-            queue_content.append(f"  out={d['filename']}")
-            queue_content.append(f"  header=User-Agent: {ua}")
-            if TOBRUT and 'huggingface.co' in d['url']:
-                queue_content.append(f"  header=Authorization: Bearer {TOBRUT}")
-            if TOKET and f'{civitai}/api/download/models/' in d['url']:
-                queue_content.append(f"  header=Authorization: Bearer {TOKET}")
-                
-        queue_file.write_text("\n".join(queue_content))
-        
-        cmd = [
-            'aria2c',
-            '-i', str(queue_file),
-            '--allow-overwrite=true',
-            '--console-log-level=error',
-            '-c',
-            '-x16', '-s16', '-k1M',
-            f'-j{max_workers}'
-        ]
-        
-        print(f"[SMFactory] Starting parallel download of {len(to_download)} files (Max Workers: {max_workers})...")
-        try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            aria2_output = ''
-            
-            while True:
-                line = p.stderr.readline()
-                if line == '' and p.poll() is not None:
-                    break
-                if line:
-                    aria2_output += line
-                    for prog in line.splitlines():
-                        m = re.match(
-                            r'\[#\w+\s+'
-                            r'(?:(\d+(?:\.\d+)?\w+/\d+(?:\.\d+)?\w+))?'
-                            r'\((\d+%)\)'
-                            r'.*?DL:(\d+(?:\.\d+)?\w+)'
-                            r'(?:.*?ETA:(\d+\w+))?',
-                            prog
-                        )
-                        if m:
-                            sizes, percent, speed, eta = m.groups()
-                            gid_match = re.search(r'\[#(\w+)', prog)
-                            gid = gid_match.group(1) if gid_match else "Parallel"
-                            
-                            percent_val = percent
-                            parts = [f"({percent_val})"]
-                            if sizes:
-                                parts.append(sizes)
-                            parts.append(f"DL:{speed}")
-                            if eta:
-                                parts.append(f"ETA:{eta}")
-                            
-                            body = ' '.join(parts)
-                            print(f"\r【#{gid} {body}】", end='', flush=True)
-            p.wait()
-            print()
-            
-            for d in to_download:
-                target_dir = d['drive_dir'] if (load_from_drive and gdrive_mounted) else d['local_dir']
-                target_file = target_dir / d['filename']
-                
-                if target_file.exists():
-                    print(f"  {GREEN}✓{RESET} {d['filename']} downloaded successfully.")
-                    if load_from_drive and gdrive_mounted:
-                        if d['local_file'].exists() or d['local_file'].is_symlink():
-                            try:
-                                d['local_file'].unlink()
-                            except Exception:
-                                pass
-                        d['local_file'].symlink_to(d['drive_file'])
-                    
-                    if d['j']:
-                        civitai_infotags(d['j'], target_dir, d['filename'], d['versionId'])
-                        t = threading.Thread(
-                            target=civitai_preview,
-                            args=(d['j'], target_dir, d['filename'], d['versionId']),
-                            daemon=True
-                        )
-                        t.start()
-                        t.join(5)
-                        
-                        if load_from_drive and gdrive_mounted:
-                            stem = Path(d['filename']).stem
-                            for ext in ['.json', '.preview.png']:
-                                side_drive = d['drive_dir'] / f"{stem}{ext}"
-                                side_local = d['local_dir'] / f"{stem}{ext}"
-                                if side_drive.exists():
-                                    if side_local.exists() or side_local.is_symlink():
-                                        try:
-                                            side_local.unlink()
-                                        except Exception:
-                                            pass
-                                    try:
-                                        side_local.symlink_to(side_drive)
-                                    except Exception:
-                                        pass
-                else:
-                    print(f"  {RED}✗{RESET} {d['filename']} download failed or file not found.")
-                    
-        except KeyboardInterrupt:
-            print("\n[SMFactory] Parallel download canceled by user.")
-        finally:
-            if queue_file.exists():
-                queue_file.unlink()
+
+    workers = min(5, max(1, len(cmds)))
+    if len(cmds) == 1:
+        run_clone(cmds[0])
+        return
+
+    print(f'  Parallel git clone: {len(cmds)} repo(s), workers={workers}, depth=1')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(run_clone, cmd) for cmd in cmds]
+        for future in concurrent.futures.as_completed(futures):
+            code = future.result()
+            if code:
+                print(f'  clone exited with code {code}')
 
 @register_line_magic
 def pull(line):
@@ -976,3 +844,6 @@ def tempe(line=''):
     ]
 
     for SUB in DIRS: Path(f'{TMP}/{SUB}').mkdir(parents=True, exist_ok=True)
+
+
+
