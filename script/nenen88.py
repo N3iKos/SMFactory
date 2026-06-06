@@ -1,44 +1,86 @@
-﻿TOKET = ''
+TOKET = ''
 TOBRUT = ''
 
 from IPython.core.magic import register_line_magic
-from IPython.display import display, HTML
+from IPython.display import display, HTML, clear_output
 from urllib.parse import urlparse
 from IPython import get_ipython
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
 import subprocess
 import threading
-import concurrent.futures
-import shutil
-import tempfile
 import requests
 import zipfile
 import shlex
 import json
+import time
 import sys
 import re
 import os
 import io
 
 MAGENTA = '\033[35m'
-RED = '\033[31m'
-CYAN = '\033[36m'
-GREEN = '\033[38;5;49m'
-YELLOW = '\033[33m'
-BLUE = '\033[38;5;69m'
-PURPLE = '\033[38;5;177m'
-ORANGE = '\033[38;5;208m'
-RESET = '\033[0m'
+RED     = '\033[31m'
+CYAN    = '\033[36m'
+GREEN   = '\033[38;5;35m'
+YELLOW  = '\033[33m'
+BLUE    = '\033[38;5;69m'
+PURPLE  = '\033[38;5;135m'
+ORANGE  = '\033[38;5;208m'
+RESET   = '\033[0m'
 
-CD = os.chdir
+CD  = os.chdir
 SyS = get_ipython().system
 iRON = os.environ
 
-KAGGLE = 'KAGGLE_DATA_PROXY_TOKEN' in iRON
-
+KAGGLE  = 'KAGGLE_DATA_PROXY_TOKEN' in iRON
 CIVITAI = ['civitai.com', 'civitai.red']
 
+# ─── Aria2c progress helpers ───────────────────────────────────────────────
+_TO_BYTES = {
+    'B': 1, 'KiB': 1024, 'MiB': 1024**2, 'GiB': 1024**3,
+    'KB': 1000, 'MB': 1000**2, 'GB': 1000**3
+}
+
+def _parse_aria2_stats(raw):
+    """Extract numeric stats from a raw aria2c progress line."""
+    s = {'pct': 0, 'done_b': 0.0, 'total_b': 0.0, 'speed_b': 0.0, 'eta_s': 0}
+    m = re.search(r'([\d.]+)(\w+)/([\d.]+)(\w+)\((\d+)%\)', raw)
+    if m:
+        s['done_b']  = float(m.group(1)) * _TO_BYTES.get(m.group(2), 1)
+        s['total_b'] = float(m.group(3)) * _TO_BYTES.get(m.group(4), 1)
+        s['pct']     = int(m.group(5))
+    m = re.search(r'DL:([\d.]+)(\w+)', raw)
+    if m: s['speed_b'] = float(m.group(1)) * _TO_BYTES.get(m.group(2), 1)
+    m = re.search(r'ETA:(\d+)(s|m|h)', raw)
+    if m: s['eta_s'] = int(m.group(1)) * {'s': 1, 'm': 60, 'h': 3600}[m.group(2)]
+    return s
+
+def _fmt_size(b):
+    for u in ('B', 'KiB', 'MiB', 'GiB'):
+        if b < 1024 or u == 'GiB': return f'{b:.1f}{u}'
+        b /= 1024
+
+def _fmt_eta(s):
+    if s <= 0: return '?'
+    return f'{s}s' if s < 60 else f'{s//60}m{s%60:02d}s'
+
+def _fmt_progress(raw):
+    """Apply ANSI formatting to a raw aria2c progress line."""
+    p = raw
+    p = re.sub(r'\[',  MAGENTA + '【' + RESET, p)
+    p = re.sub(r'\]',  MAGENTA + '】' + RESET, p)
+    p = re.sub(r'(#)(\w+)', f'{CYAN}\\1{RESET}{GREEN}\\2{RESET}', p)
+    p = re.sub(r'(\d+(\.\d+)?)(\w+)(/)(\d+(\.\d+)?)(\w+)',
+               f'\\1{PURPLE}\\3{RESET}{MAGENTA}\\4{RESET}\\5{PURPLE}\\7{RESET}', p)
+    p = re.sub(r'(\()(\d+%)(\))', f'{MAGENTA}\\1{RESET}\\2{MAGENTA}\\3{RESET}', p)
+    p = re.sub(r'(CN)(:)(\d+)',   f'{CYAN}\\1{RESET}\\2{ORANGE}\\3{RESET}', p)
+    p = re.sub(r'(DL)(:)([\d.]+)(\w+)', f'{CYAN}\\1{RESET}\\2\\3{PURPLE}\\4{RESET}', p)
+    p = re.sub(r'(ETA)(:)(\d+\w+)', f'{CYAN}\\1{RESET}\\2{YELLOW}\\3{RESET}', p)
+    return p
+
+# ─── IPython magic: %say ───────────────────────────────────────────────────
 @register_line_magic
 def say(line):
     args = re.findall(r'\{[^\{\}]+\}|[^\s\{\}]+', line)
@@ -48,23 +90,23 @@ def say(line):
 
     i = 0
     while i < len(args):
-        msg = args[i]
+        msg   = args[i]
         color = None
 
         if re.match(r'^\{[^\{\}]+\}$', msg.lower()):
             color = msg[1:-1]
-            msg = ''
+            msg   = ''
         else:
             while i < len(args) - 1 and not re.match(r'^\{[^\{\}]+\}$', args[i + 1].lower()):
-                i += 1
+                i   += 1
                 msg += ' ' + args[i]
 
         if color == 'd':
             color = default_color
         elif color is None and i < len(args) - 1:
             if re.match(r'^\{[^\{\}]+\}$', args[i + 1].lower()):
-                color = args[i + 1][1:-1]
-                i += 1
+                color  = args[i + 1][1:-1]
+                i     += 1
 
         span_text = f'<span'
         if color:
@@ -75,108 +117,7 @@ def say(line):
 
     display(HTML(' '.join(output)))
 
-
-def _truthy(value):
-    return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on', 'parallel'}
-
-def _safe_int(value, default, minimum=1, maximum=16):
-    try:
-        parsed = int(value)
-        return max(minimum, min(maximum, parsed))
-    except Exception:
-        return default
-
-def _parse_download_options(parts):
-    clean, opts = [], {'parallel': False, 'workers': 3, 'connections': 16}
-    skip = False
-    for idx, part in enumerate(parts):
-        if skip:
-            skip = False
-            continue
-        if part in {'--parallel', '-P'}:
-            opts['parallel'] = True
-        elif part.startswith('--parallel='):
-            opts['parallel'] = _truthy(part.split('=', 1)[1])
-        elif part in {'--workers', '--max-workers', '-j'} and idx + 1 < len(parts):
-            opts['workers'] = _safe_int(parts[idx + 1], opts['workers'], 1, 10)
-            skip = True
-        elif part.startswith('--workers=') or part.startswith('--max-workers='):
-            opts['workers'] = _safe_int(part.split('=', 1)[1], opts['workers'], 1, 10)
-        elif part.startswith('--connections='):
-            opts['connections'] = _safe_int(part.split('=', 1)[1], opts['connections'], 1, 16)
-        else:
-            clean.append(part)
-    return clean, opts
-
-def _download_target(line):
-    parts = line.strip().split()
-    if not parts:
-        return None
-    url = parts[0].replace('\\', '')
-    target_dir = Path.cwd()
-    filename = None
-    if len(parts) >= 3:
-        a, b = parts[1], parts[2]
-        a_path = '/' in a or '~/' in a
-        b_path = '/' in b or '~/' in b
-        if b_path and not a_path:
-            target_dir, filename = Path(b).expanduser(), a
-        elif a_path and not b_path:
-            target_dir, filename = Path(a).expanduser(), b
-        elif Path(b).suffix == '' and Path(a).suffix != '':
-            target_dir, filename = Path(b).expanduser(), a
-        else:
-            target_dir, filename = Path(a).expanduser(), b
-    elif len(parts) == 2:
-        a = parts[1]
-        if '/' in a or '~/' in a:
-            target_dir = Path(a).expanduser()
-        else:
-            filename = a
-    if not filename:
-        filename = Path(urlparse(url).path).name or 'download.bin'
-    return url, target_dir, filename
-
-def parallel_download(lines, max_workers=3, connections=16):
-    entries = []
-    for line in lines:
-        target = _download_target(line)
-        if not target:
-            continue
-        url, target_dir, filename = target
-        url, _, _, filename = get_url(url, filename)
-        if not url:
-            continue
-        target_dir.mkdir(parents=True, exist_ok=True)
-        entries.append((url, target_dir, filename))
-    if not entries:
-        print('  missing URL, downloading nothing')
-        return
-    if not shutil.which('aria2c'):
-        print('  aria2c not found; falling back to sequential download')
-        for line in lines:
-            netorare(line)
-        return
-    queue = Path('/tmp/aria2_queue.txt')
-    with queue.open('w', encoding='utf-8') as handle:
-        for url, target_dir, filename in entries:
-            handle.write(f'{url}\n')
-            handle.write(f'  dir={target_dir}\n')
-            handle.write(f'  out={filename}\n')
-            handle.write('  continue=true\n')
-            handle.write('  allow-overwrite=true\n')
-            if TOBRUT and 'huggingface.co' in url:
-                handle.write(f'  header=Authorization: Bearer {TOBRUT}\n')
-    cmd = [
-        'aria2c', '-i', str(queue),
-        '--console-log-level=notice', '--summary-interval=1',
-        '--max-concurrent-downloads', str(max_workers),
-        '--split', str(connections),
-        '--max-connection-per-server', str(connections),
-        '--min-split-size=1M', '--continue=true'
-    ]
-    print(f'  Parallel download: {len(entries)} file(s), workers={max_workers}, connections={connections}')
-    subprocess.run(cmd, check=False)
+# ─── IPython magic: %download ─────────────────────────────────────────────
 @register_line_magic
 def download(i):
     args = i.split()
@@ -184,48 +125,42 @@ def download(i):
         print('  missing URL, downloading nothing')
         return
 
-    url = args[0]
+    url  = args[0]
     path = Path(url).expanduser()
     if url.endswith('.txt') and path.is_file():
         for l in path.read_text(encoding='utf-8').splitlines(): netorare(l)
-    else: netorare(i)
+    else:
+        netorare(i)
 
+# ─── Helpers ──────────────────────────────────────────────────────────────
 def netorare(line):
     fp, fn = None, None
 
     parts = line.strip().split()
     if not parts: return
 
-    cwd = Path.cwd()
+    cwd  = Path.cwd()
+    url  = parts[0].replace('\\', '')
+    C    = any(u in url for u in CIVITAI)
+    H    = 'huggingface.co' in url
+    G    = 'github.com' in url
+    D    = 'drive.google.com' in url
     path = lambda s: '/' in s or '~/' in s
-    url = parts[0].replace('\\', '')
-
-    C = any(u in url for u in CIVITAI)
-    H = 'huggingface.co' in url
-    G = 'github.com' in url
-    D = 'drive.google.com' in url
 
     try:
         if len(parts) >= 3:
             a, b = parts[1], parts[2]
-
-            aa = path(a)
-            bb = path(b)
-
-            if bb and not aa: p, f = b, a
-            elif aa and not bb: p, f = a, b
+            if path(b) and not path(a): p, f = b, a
+            elif path(a) and not path(b): p, f = a, b
             elif Path(b).suffix == '' and Path(a).suffix != '': p, f = b, a
             else: p, f = a, b
-
             fp = Path(p).expanduser()
             fn = f
-
             fp.mkdir(parents=True, exist_ok=True)
             CD(fp)
 
         elif len(parts) == 2:
             a = parts[1]
-
             if path(a):
                 fp = Path(a).expanduser()
                 fp.mkdir(parents=True, exist_ok=True)
@@ -234,20 +169,17 @@ def netorare(line):
             else:
                 fn = a
                 fp = cwd
-
         else:
             fn = (None if (C or D) else Path(urlparse(url).path).name)
             fp = cwd
 
         if C or H or G: ariari(url, fp, fn)
-
         elif D: gdrown(url, fp, fn)
-
         else:
-            cp = (len(parts) == 2 and fp is not None)
+            cp  = (len(parts) == 2 and fp is not None)
             cmd = (
-              f"curl -#{'OJL' if len(parts) == 1 or cp else 'JL'} '{url}'" +
-              (f" -o '{fn}'" if fn is not None and not cp else "")
+                f"curl -#{'OJL' if len(parts) == 1 or cp else 'JL'} '{url}'" +
+                (f" -o '{fn}'" if fn is not None and not cp else "")
             )
             curlly(cmd, fn)
 
@@ -276,16 +208,20 @@ def civitai_preview(j, p, fn, versionId=None):
     if not v: return
 
     images = v.get('images', [])
-    name = fn or v.get('files', [{}])[0].get('name')
+    name   = fn or v.get('files', [{}])[0].get('name')
     if not name: return
 
     path = Path(p) / f'{Path(name).stem}.preview.png'
     if path.exists(): return
 
-    preview = next((img.get('url', '') for img in images if not img.get('url', '').lower().endswith(('.mp4', '.gif'))), None)
+    preview = next(
+        (img.get('url', '') for img in images
+         if not img.get('url', '').lower().endswith(('.mp4', '.gif'))),
+        None
+    )
     if not preview: return
 
-    r = requests.get(preview, headers=civitai_headers()).content
+    r       = requests.get(preview, headers=civitai_headers()).content
     resized = resizer(r)
 
     if KAGGLE:
@@ -299,31 +235,24 @@ def civitai_infotags(j, p, fn, versionId=None):
     if not v: return
 
     modelId = j.get('id') or v.get('modelId')
-    name = fn or v.get('files', [{}])[0].get('name')
+    name    = fn or v.get('files', [{}])[0].get('name')
     if not name: return
 
     info = Path(p) / f'{Path(name).stem}.json'
     if info.exists(): return
 
     baseList = {
-        'SD 1': 'SD1',
-        'SD 1.5': 'SD1',
-        'SD 2': 'SD2',
-        'SD 3': 'SD3',
-        'SDXL': 'SDXL',
-        'Pony': 'SDXL',
-        'Illustrious': 'SDXL',
-        'Anima': 'Anima',
-        'ZImageBase': 'ZImageBase',
-        'ZImageTurbo': 'ZImageTurbo',
+        'SD 1': 'SD1', 'SD 1.5': 'SD1', 'SD 2': 'SD2', 'SD 3': 'SD3',
+        'SDXL': 'SDXL', 'Pony': 'SDXL', 'Illustrious': 'SDXL',
+        'Anima': 'Anima', 'ZImageBase': 'ZImageBase', 'ZImageTurbo': 'ZImageTurbo',
     }
 
     data = {
         'activation text': ', '.join(v.get('trainedWords', [])),
-        'sd version': next((s for k, s in baseList.items() if k in v.get('baseModel', '')), ''),
-        'modelId': modelId,
-        'modelVersionId': v.get('id'),
-        'sha256': v.get('files', [{}])[0].get('hashes', {}).get('SHA256')
+        'sd version':      next((s for k, s in baseList.items() if k in v.get('baseModel', '')), ''),
+        'modelId':         modelId,
+        'modelVersionId':  v.get('id'),
+        'sha256':          v.get('files', [{}])[0].get('hashes', {}).get('SHA256')
     }
 
     info.write_text(json.dumps(data, indent=4))
@@ -333,9 +262,9 @@ def civitai_earlyAccess(j, versionId=None, civitai=None):
     if not v: return False
 
     if v.get('availability') == 'EarlyAccess' or v.get('earlyAccessEndsAt'):
-        modelId = j.get('id') or v.get('modelId')
+        modelId        = j.get('id') or v.get('modelId')
         modelVersionId = v.get('id')
-        page = f'https://{civitai}/models/{modelId}?modelVersionId={modelVersionId}'
+        page           = f'https://{civitai}/models/{modelId}?modelVersionId={modelVersionId}'
         print(f'{page}\n-> The model version is in early access and requires payment for downloading.')
         return True
 
@@ -347,7 +276,6 @@ def civitai_file(j, versionId=None):
 
     f = next((f for f in v.get('files', []) if f.get('downloadUrl')), None)
     n = ((f.get('name') if f else None) or v.get('name'))
-
     return f, n
 
 def get_json(api_url, headers):
@@ -360,9 +288,9 @@ def get_json(api_url, headers):
 
 def get_civitai(j, versionId=None):
     v = None
-
     if versionId:
-        if 'modelVersions' in j: v = next((mv for mv in j['modelVersions'] if str(mv.get('id')) == str(versionId)), None)
+        if 'modelVersions' in j:
+            v = next((mv for mv in j['modelVersions'] if str(mv.get('id')) == str(versionId)), None)
         if not v and str(j.get('id')) == str(versionId) and 'files' in j: v = j
 
     if not v:
@@ -379,37 +307,32 @@ def get_url(url, fn):
 
     elif 'huggingface.co' in url:
         url = url.split('?')[0]
-
         headers = {
             'User-Agent': 'Mozilla/5.0',
             **({'Authorization': f'Bearer {TOBRUT}'} if TOBRUT else {})
         }
-
         ext = ['.safetensors', '.pt', '.pth']
         j, versionId = None, None
 
         if fn and Path(fn).suffix.lower() in ext:
             try:
                 raw_url = re.sub(r'/(resolve|blob)/', '/raw/', url)
-                res = requests.get(raw_url, headers=headers, timeout=15)
-
-                t = re.search(r'oid sha256:([a-fA-F0-9]{64})', res.text)
+                res     = requests.get(raw_url, headers=headers, timeout=15)
+                t       = re.search(r'oid sha256:([a-fA-F0-9]{64})', res.text)
                 if t:
                     sha256 = t.group(1).lower()
-
                     for c in CIVITAI:
                         try:
                             api_url = f'https://{c}/api/v1/model-versions/by-hash/{sha256}'
-                            j_try = get_json(api_url, civitai_headers())
+                            j_try   = get_json(api_url, civitai_headers())
                             if not j_try: continue
-
-                            r = next((f for f in j_try.get('files', []) if f.get('hashes', {}).get('SHA256', '').lower() == sha256), None)
-                            if r:
-                                j = j_try
-                                break
-
+                            r2 = next(
+                                (f for f in j_try.get('files', [])
+                                 if f.get('hashes', {}).get('SHA256', '').lower() == sha256),
+                                None
+                            )
+                            if r2: j = j_try; break
                         except Exception: continue
-
             except Exception: pass
 
         url = url.replace('/blob/', '/resolve/')
@@ -417,55 +340,46 @@ def get_url(url, fn):
 
     elif civitai in url:
         input_url = url
-        url = url.split('?token=')[0]
+        url       = url.split('?token=')[0]
 
         if f'{civitai}/api/download/models/' in url:
             versionId = url.split('models/')[1].split('/')[0].split('?')[0]
-            api_url = f'https://{civitai}/api/v1/model-versions/{versionId}'
-
-            j = get_json(api_url, civitai_headers())
+            api_url   = f'https://{civitai}/api/v1/model-versions/{versionId}'
+            j         = get_json(api_url, civitai_headers())
             if not j: return url, None, None, None
-
             f, cfn = civitai_file(j, versionId)
             if not f: return url, None, None, None
-
             return url, j, versionId, (fn or cfn)
 
         elif f'{civitai}/models/' in url:
             versionId = None
-            modelId = url.split('models/')[1].split('/')[0].split('?')[0]
-
-            if '?modelVersionId=' in url: versionId = url.split('?modelVersionId=')[1].split('&')[0]
-
+            modelId   = url.split('models/')[1].split('/')[0].split('?')[0]
+            if '?modelVersionId=' in url:
+                versionId = url.split('?modelVersionId=')[1].split('&')[0]
             api_url = f'https://{civitai}/api/v1/models/{modelId}'
-            j = get_json(api_url, civitai_headers())
+            j       = get_json(api_url, civitai_headers())
             if not j or civitai_earlyAccess(j, versionId, civitai): return None, None, None, None
-
             f, cfn = civitai_file(j, versionId)
             if not f:
                 print(f'Unable to find download URL for\n-> {input_url}\n')
                 return None, None, None, None
-
             return f['downloadUrl'], j, versionId, (fn or cfn)
 
     return url, None, None, fn
 
-def ariari(url, fp, fn):
+def ariari(url, fp, fn, on_progress=None):
     url, j, versionId, fn = get_url(url, fn)
     if not url: return
 
     civitai = get_civdom(url)
-
     headers = {'User-Agent': (civitai_headers()['User-Agent'] if civitai else 'Mozilla/5.0')}
 
     if TOKET and f'{civitai}/api/download/models/' in url:
         headers['Authorization'] = f'Bearer {TOKET}'
-
         try:
             r = requests.get(url, headers=headers, allow_redirects=True, stream=True, timeout=30)
             if r.url and r.url != url: url = r.url
             r.close()
-
         except Exception as e:
             print(f'  Preflight failed: {e}')
             print('  Falling back to aria2 with Authorization header.')
@@ -474,104 +388,69 @@ def ariari(url, fp, fn):
         'aria2c',
         f"--header=User-Agent: {headers['User-Agent']}",
         '--allow-overwrite=true', '--console-log-level=error', '--stderr=true',
-        '-c', '-x16', '-s16', '-k1M', '-j5' 
+        '--auto-file-renaming=false', '--min-split-size=1M',
+        f'--dir={str(fp)}',
+        '-c', '-x16', '-s16', '-k1M', '-j5'
     ]
 
-    if TOBRUT and 'huggingface.co' in url: cmd.append(f'--header=Authorization: Bearer {TOBRUT}')
+    if TOKET and civitai and f'{civitai}/api/download/models/' in url:
+        cmd.append(f'--header=Authorization: Bearer {TOKET}')
+    if TOBRUT and 'huggingface.co' in url:
+        cmd.append(f'--header=Authorization: Bearer {TOBRUT}')
     if fn: cmd += ['-o', fn]
-
     cmd.append(url)
 
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        aria2_output, bl, error_code, error_line = '', False, [], []
+        p    = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        aria2_output, break_line, error_code, error_line = '', False, [], []
 
         while True:
             lines = p.stderr.readline()
-
             if lines == '' and p.poll() is not None: break
 
             if lines:
                 aria2_output += lines
-
                 for prog in lines.splitlines():
                     if 'errorCode' in prog or 'Exception' in prog:
                         error_code.append(prog)
-
                     if '|' in prog and 'error_line' in prog:
-                        prog = re.sub(r'(\|\s*)(error_line)(\s*\|)', f'\\1{RED}\\2{RESET}\\3', prog)
+                        prog  = re.sub(r'(\|\s*)(error_line)(\s*\|)', f'\\1{RED}\\2{RESET}\\3', prog)
                         first, _, last = prog.rpartition('|')
-                        last = re.sub(r'/', f'{CYAN}/{RESET}', last)
-                        prog = f'{first}|{last}'
+                        last  = re.sub(r'/', f'{CYAN}/{RESET}', last)
+                        prog  = f'{first}|{last}'
                         error_line.append(prog)
 
-                    m = re.match(
-                        r'\[#\w+\s+'
-                        r'(?:(\d+(?:\.\d+)?\w+/\d+(?:\.\d+)?\w+))?'
-                        r'\((\d+%)\)'
-                        r'.*?DL:(\d+(?:\.\d+)?\w+)'
-                        r'(?:.*?ETA:(\d+\w+))?',
-                        prog
-                    )
-
-                    if m:
-                        sizes, percent, speed, eta = m.groups()
-
-                        percent = re.sub(r'(\d+)(%)', f'\\1{PURPLE}\\2{RESET}', percent)
-                        parts = [f'{MAGENTA}({RESET}{percent}{MAGENTA}){RESET}']
-
-                        if sizes:
-                            current, total = sizes.split('/')
-                            current = re.sub(r'(\d+(?:\.\d+)?)(\w+)', f'\\1{PURPLE}\\2{RESET}', current)
-                            total = re.sub(r'(\d+(?:\.\d+)?)(\w+)', f'\\1{PURPLE}\\2{RESET}', total)
-                            parts.append(f'{current}' f'{CYAN}/{RESET}' f'{total}')
-
-                        speed = re.sub(r'(\d+(?:\.\d+)?)(\w+)', f'\\1{PURPLE}\\2{RESET}', speed)
-                        parts.append(f'{CYAN}DL{RESET}:' f'{speed}')
-
-                        if eta:
-                            parts.append(f'{CYAN}ETA{RESET}:' f'{YELLOW}{eta}{RESET}')
-
-                        body = ' '.join(parts)
-
-                        r = (
-                            f'{fn} '
-                            #f'{MAGENTA}ã€{RESET}'
-                            f'{body}'
-                            #f'{MAGENTA}ã€‘{RESET}'
-                        )
-
-                        print(f"\r{' '*300}\r  {RED}â—{RESET} {r}", end='')
-                        sys.stdout.flush()
-
-                        bl = True
+                    if re.match(r'\[#\w{6}\s.*\]', prog):
+                        raw_prog = prog
+                        if on_progress:
+                            on_progress(raw_prog)
+                        else:
+                            formatted = _fmt_progress(raw_prog)
+                            print(f"\r{' '*300}\r {formatted}", end='')
+                            sys.stdout.flush()
+                        break_line = True
                         break
 
-        civitai = None
         error = error_code + error_line
         for lines in error: print(f'  {lines}')
 
-        for lines in aria2_output.splitlines():
-            if '|' in lines and 'OK' in lines:
-                pipe = [p.strip() for p in lines.split('|')]
+        if break_line and not on_progress: print()
 
-                if len(pipe) >= 4:
-                    saved = pipe[3]
-                    saved = re.sub(r'/', f'{ORANGE}/{RESET}', saved)
-                    print(f"\r{' '*300}\r  {GREEN}â—{RESET} {saved}")
-                    sys.stdout.flush()
-                    bl = False
-
-        bl and print()
-        p.wait()
+        stripe = aria2_output.find('======+====+===========')
+        if stripe != -1:
+            for lines in aria2_output[stripe:].splitlines():
+                if '|' in lines and 'OK' in lines:
+                    lines = re.sub(r'(\|\s*)(OK)(\s*\|)', f'\\1{GREEN}\\2{RESET}\\3', lines)
+                    first, _, last = lines.rpartition('|')
+                    last  = re.sub(r'/', f'{ORANGE}/{RESET}', last)
+                    lines = f'{first}|{last}'
+                    print(f'  {lines}')
 
         if j:
             civitai_infotags(j, fp, fn, versionId)
-            threading.Thread(
-                target=civitai_preview,
-                args=(j, fp, fn, versionId),
-                daemon=True
-            ).start()
+            civitai_preview(j, fp, fn, versionId)
+
+        p.wait()
 
     except KeyboardInterrupt:
         print(f'\n{"":>2}^ Canceled')
@@ -583,14 +462,13 @@ def curlly(cmd, fn):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1
         )
-
-        prog = re.compile(r'(\d+\.\d+)%')
+        prog        = re.compile(r'(\d+\.\d+)%')
         curl_output = ''
 
         with tqdm(
             total=100, desc=f'{fn.ljust(58):>{58 + 2}}', initial=0,
-            bar_format='{desc} ã€{bar:20}ã€‘ã€{percentage:3.0f}%ã€‘',
-            ascii='â–·â–¶', file=sys.stdout
+            bar_format='{desc} 【{bar:20}】【{percentage:3.0f}%】',
+            ascii='▷▶', file=sys.stdout
         ) as pbar:
             for line in iter(p.stderr.readline, ''):
                 if line.strip():
@@ -599,7 +477,6 @@ def curlly(cmd, fn):
                         progress = float(match.group(1))
                         pbar.update(progress - pbar.n)
                         pbar.refresh()
-
                 curl_output += line
             pbar.close()
         p.wait()
@@ -614,97 +491,77 @@ def curlly(cmd, fn):
                 print('')
             else:
                 print(f"{'':>2}^ Error: {curl_output}")
-        else:
-            pass
 
     except KeyboardInterrupt:
         print(f"{'':>2}^ Canceled")
 
 def gdrown(url, fp=None, fn=None):
     folder = 'drive.google.com/drive/folders' in url
-    cmd = ['gdown', '--fuzzy']
-
+    cmd    = ['gdown', '--fuzzy']
     if folder: cmd.append('--folder')
     cmd.append(url)
 
-    name = fn or None
-    saved = None
+    name, saved = fn or None, None
 
     if fp:
         fp = Path(fp).expanduser()
         fp.mkdir(parents=True, exist_ok=True)
-
         if fn:
             fn = fp / fn
             cmd += ['-O', str(fn)]
-
         cwd = str(fp)
-
     else:
         cwd = None
-
         if fn: cmd += ['-O', fn]
 
     try:
-        p = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-
+        p  = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, bufsize=1)
         bl = False
 
         while True:
             prog = p.stdout.readline()
-
             if prog == '' and p.poll() is not None: break
             if not prog: continue
-
             prog = prog.strip()
             if not prog: continue
 
             if prog.startswith('To: '):
                 try:
                     saved = prog[4:].strip()
-                    name = Path(saved).name
+                    name  = Path(saved).name
                 except: pass
                 continue
 
             if '%' in prog and '/' in prog:
                 prog = re.sub(r'(\d+)(%)', f'\\1{PURPLE}\\2{RESET}', prog)
                 prog = re.sub(r'(\d+(?:\.\d+)?[KMG]B/s)', f'{CYAN}\\1{RESET}', prog)
-                print(f"\r{' '*300}\r  {RED}â—{RESET} {name} {prog}", end='')
-
+                print(f"\r{' '*300}\r  {RED}●{RESET} {name} {prog}", end='')
                 sys.stdout.flush()
                 bl = True
-
             else:
                 skip = (
                     'Downloading...' in prog or
                     'From (original):' in prog or
                     'From (redirected):' in prog
                 )
-
                 if skip: continue
                 if bl: print()
-
-                print(f'  {GREEN}â—{RESET} {prog}')
+                print(f'  {GREEN}●{RESET} {prog}')
                 bl = False
 
         p.wait()
 
         if saved:
             saved = re.sub(r'/', f'{ORANGE}/{RESET}', saved)
-            print(f"\r{' '*300}\r  {GREEN}â—{RESET} {saved}")
+            print(f"\r{' '*300}\r  {GREEN}●{RESET} {saved}")
 
     except KeyboardInterrupt:
         try: p.terminate()
         except: pass
         print(f'\n{"":>2}^ Canceled')
 
+# ─── IPython magic: %clone ────────────────────────────────────────────────
 @register_line_magic
 def clone(i):
     p = Path(i).expanduser()
@@ -712,66 +569,296 @@ def clone(i):
     def proc(line):
         return line.strip()[len('git clone '):].strip() if line.strip().startswith('git clone') else line.strip()
 
-    def normalize(line):
-        raw = proc(line)
-        if not raw:
-            return None
-        parts = shlex.split(raw)
-        if '--depth' not in parts and not any(part.startswith('--depth=') for part in parts):
-            parts = ['--depth', '1'] + parts
-        if '--recurse-submodules' not in parts:
-            parts = ['--recurse-submodules'] + parts
-        return ['git', 'clone'] + parts
+    if p.suffix == '.txt' and p.is_file():
+        cmds = [f'git clone {proc(line)}' for line in p.read_text().splitlines()]
+    elif isinstance(i, str):
+        cmds = [f'git clone {proc(i)}']
+    else:
+        cmds = [f'git clone {proc(l)}' for l in i]
 
-    def run_clone(cmd_list):
-        url = next((repo for repo in cmd_list if re.match(r'https?://', repo)), None)
-        dest = None
-        if len(cmd_list) >= 4 and not cmd_list[-1].startswith('-') and not re.match(r'https?://', cmd_list[-1]):
-            dest = Path(cmd_list[-1]).expanduser()
-        if dest and dest.exists():
-            print(f'  skip existing ▶ {dest}')
-            return 0
+    for cmd in cmds:
+        cmd = cmd.strip()
+        if not cmd: continue
+
+        cmd_list = shlex.split(cmd)
+        url      = next((repo for repo in cmd_list if re.match(r'https?://', repo)), None)
+
         p = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
         while True:
             output = p.stdout.readline()
-            if not output and p.poll() is not None:
-                break
+            if not output and p.poll() is not None: break
             if output := output.strip():
-                if 'fatal' in output.lower() or 'error' in output.lower():
+                if 'fatal' in output:
                     print(f'  {output}')
                 elif output.startswith('Cloning into'):
-                    try:
-                        repo_name = "/".join(output.split("'")[1].split("/")[-3:])
-                    except Exception:
-                        repo_name = output
+                    repo_name = "/".join(output.split("'")[1].split("/")[-3:])
                     print(f'  {repo_name} ▶ {url}')
+
         p.wait()
-        return p.returncode
 
-    if p.suffix == '.txt' and p.is_file():
-        raw_lines = [line for line in p.read_text().splitlines() if line.strip()]
-    elif isinstance(i, str):
-        raw_lines = [i]
-    else:
-        raw_lines = list(i)
+# ─── Parallel shallow clone ────────────────────────────────────────────────
+def parallel_clone(urls, dest_dir, max_workers=5):
+    """
+    Clone multiple git repos in parallel using `--depth 1 --recurse-submodules`.
+    Falls back to a full clone if shallow clone fails.
 
-    cmds = [cmd for cmd in (normalize(line) for line in raw_lines) if cmd]
-    if not cmds:
+    Parameters
+    ----------
+    urls : list of str
+        Full git clone URLs (or 'git clone ...' prefixed strings, or a path to a .txt file).
+    dest_dir : Path
+        Target directory in which to run the clones.
+    max_workers : int
+        Number of concurrent clone threads (default: 5).
+    """
+    if not urls:
         return
 
-    workers = min(5, max(1, len(cmds)))
-    if len(cmds) == 1:
-        run_clone(cmds[0])
+    dest_dir = Path(dest_dir)
+    _lock    = threading.Lock()
+
+    def _do_clone(entry):
+        entry = entry.strip()
+        if not entry or entry.startswith('#'):
+            return
+        if entry.startswith('git clone '):
+            entry = entry[len('git clone '):].strip()
+
+        parts        = entry.split()
+        repo_url     = parts[0]
+        folder_name  = parts[1] if len(parts) > 1 else None
+        display_name = folder_name if folder_name else repo_url.split('/')[-1].replace('.git', '')
+
+        cmd = ['git', 'clone', '--depth=1', '--recurse-submodules', '--quiet', repo_url]
+        if folder_name:
+            cmd.append(folder_name)
+
+        try:
+            result = subprocess.run(cmd, cwd=str(dest_dir), capture_output=True, text=True)
+            with _lock:
+                if result.returncode == 0:
+                    print(f'  {GREEN}✓{RESET} {display_name}')
+                else:
+                    # Retry without --depth (some repos disallow shallow clone)
+                    cmd_full = ['git', 'clone', '--recurse-submodules', '--quiet', repo_url]
+                    if folder_name:
+                        cmd_full.append(folder_name)
+                    r2 = subprocess.run(cmd_full, cwd=str(dest_dir), capture_output=True, text=True)
+                    if r2.returncode == 0:
+                        print(f'  {GREEN}✓{RESET} {display_name}')
+                    else:
+                        print(f'  {RED}✗{RESET} {display_name}: {r2.stderr.strip()[:120]}')
+        except Exception as e:
+            with _lock:
+                print(f'  {RED}✗{RESET} {display_name}: {e}')
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool.map(_do_clone, urls)
+
+# ─── parallel_download_list (for setup.py use) ────────────────────────────
+def parallel_download_list(items, max_workers=4):
+    """
+    Fan out a list of download() calls concurrently (used during setup/installation).
+
+    Parameters
+    ----------
+    items : list of str
+        Each item is a raw string passed to %download (e.g. 'https://.../model.safetensors /path/to/dir').
+    max_workers : int
+        Concurrent downloads. Default 4.
+    """
+    if not items:
         return
 
-    print(f'  Parallel git clone: {len(cmds)} repo(s), workers={workers}, depth=1')
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(run_clone, cmd) for cmd in cmds]
-        for future in concurrent.futures.as_completed(futures):
-            code = future.result()
-            if code:
-                print(f'  clone exited with code {code}')
+    def _do(item):
+        try:
+            get_ipython().run_line_magic('download', item)
+        except Exception as e:
+            print(f'  {RED}download error: {e}{RESET}')
 
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool.map(_do, items)
+
+# ─── parallel_batch_download — aria2c queue-file approach ─────────────────
+_print_lock = threading.Lock()
+
+def parallel_batch_download(items, max_workers=3, drive_base=None, category=None):
+    """
+    Download multiple files using an aria2c input-file queue for true multi-stream
+    parallel bulk downloading, with optional Google Drive persistent storage.
+
+    Progress output per active download is rendered live in a single refreshing block:
+        【#f374eb 614MiB/6.6GiB( 9%) CN:16 DL:32MiB  ETA:3m12s】
+        【#Parallel 2.9GiB/32.4GiB(8%) DL:146.0MiB/s ETA:3m00s】
+
+    Parameters
+    ----------
+    items : list of (url, dest_dir, filename|None)
+        Each tuple describes one file to download.
+    max_workers : int
+        Number of simultaneous files (parallel jobs). Default 3.
+    drive_base : str | Path | None
+        If provided, path to the Google Drive category folder (e.g.
+        `/content/drive/MyDrive/Segsmaker/checkpoint`).
+        Files already present on Drive are symlinked and skipped.
+        Files not present are downloaded locally then copied to Drive.
+    category : str | None
+        Sub-folder name under drive_base for saving downloaded files to Drive.
+    """
+    if not items:
+        return {}
+
+    total   = len(items)
+    results = {}
+
+    # ── Shared state (written by workers / renderer) ───────────────────────
+    _state_lock = threading.Lock()
+    _state      = {}
+
+    def _set_state(idx, **kw):
+        with _state_lock:
+            if idx not in _state:
+                _state[idx] = {'label': '', 'raw': '', 'done': False, 'ok': True}
+            _state[idx].update(kw)
+
+    # ── Real-time renderer ─────────────────────────────────────────────────
+    _stop_render = threading.Event()
+
+    def _build_frame():
+        with _state_lock:
+            snap = {k: dict(v) for k, v in _state.items()}
+
+        lines_out = []
+        agg_speed = 0.0; agg_done = 0.0; agg_total = 0.0; agg_eta = 0; active = 0
+
+        for i in range(total):
+            slot  = snap.get(i, {})
+            label = slot.get('label', f'file {i+1}')
+            done  = slot.get('done', False)
+            ok    = slot.get('ok', True)
+            raw   = slot.get('raw', '')
+
+            if done:
+                icon = f'{GREEN}✓{RESET}' if ok else f'{RED}✗{RESET}'
+                lines_out.append(f'  [{i+1:2}/{total}] {icon} {label}')
+            elif raw:
+                lines_out.append(f' {_fmt_progress(raw)}')
+                st         = _parse_aria2_stats(raw)
+                agg_speed += st['speed_b']
+                agg_done  += st['done_b']
+                agg_total += st['total_b']
+                agg_eta    = max(agg_eta, st['eta_s'])
+                active    += 1
+            else:
+                lines_out.append(f'  [{i+1:2}/{total}] {YELLOW}⏳{RESET} {label} — starting...')
+
+        # Aggregate summary line
+        if active > 0:
+            pct     = int(100 * agg_done / agg_total) if agg_total else 0
+            spd     = _fmt_size(agg_speed) + '/s'
+            done_s  = _fmt_size(agg_done)
+            total_s = _fmt_size(agg_total)
+            eta     = _fmt_eta(agg_eta)
+            agg_line = (
+                f' {MAGENTA}【{RESET}'
+                f'{CYAN}#Parallel{RESET} '
+                f'{done_s}{MAGENTA}/{RESET}{total_s}'
+                f'{MAGENTA}({RESET}{pct}%{MAGENTA}){RESET} '
+                f'{CYAN}DL{RESET}:{PURPLE}{spd}{RESET} '
+                f'{CYAN}ETA{RESET}:{YELLOW}{eta}{RESET}'
+                f'{MAGENTA}】{RESET}'
+            )
+        else:
+            done_c   = sum(1 for s in snap.values() if s.get('done'))
+            agg_line = f'  {CYAN}▶ {done_c}/{total} completed{RESET}'
+
+        lines_out.append(agg_line)
+        return '\n'.join(lines_out)
+
+    def _render_loop():
+        while not _stop_render.is_set():
+            frame = _build_frame()
+            clear_output(wait=True)
+            print(frame)
+            sys.stdout.flush()
+            _stop_render.wait(0.25)
+        # Final frame
+        clear_output(wait=True)
+        print(_build_frame())
+        sys.stdout.flush()
+
+    renderer = threading.Thread(target=_render_loop, daemon=True, name='progress-renderer')
+    renderer.start()
+
+    # ── Workers ───────────────────────────────────────────────────────────
+    def _worker(idx, url, fp, fn):
+        label = fn if fn else Path(urlparse(url).path).name or url
+        _set_state(idx, label=label)
+
+        try:
+            fp = Path(fp).expanduser()
+            fp.mkdir(parents=True, exist_ok=True)
+
+            # ── Google Drive skip-if-exists logic ─────────────────────────
+            if drive_base and label:
+                drive_path = Path(drive_base) / label
+                if drive_path.exists():
+                    target = fp / label
+                    if not target.exists():
+                        target.symlink_to(drive_path)
+                    _set_state(idx, done=True, ok=True, raw='', label=f'{label} (from Drive)')
+                    return url, 'ok'
+
+            def _on_progress(raw):
+                _set_state(idx, raw=raw)
+
+            CHG = any(domain in url for domain in [*CIVITAI, 'huggingface.co', 'github.com'])
+            if CHG:
+                ariari(url, fp, fn, on_progress=_on_progress)
+            elif 'drive.google.com' in url:
+                gdrown(url, fp, fn)
+            else:
+                cmd     = (f"curl -#OJL '{url}'" if not fn else f"curl -#L '{url}' -o '{fn}'")
+                old_cwd = Path.cwd()
+                CD(fp)
+                curlly(cmd, fn or label)
+                CD(old_cwd)
+
+            # ── Copy to Google Drive after download ───────────────────────
+            if drive_base and label:
+                drive_path = Path(drive_base) / label
+                if not drive_path.exists():
+                    import shutil
+                    local_file = fp / label
+                    if local_file.exists():
+                        shutil.copy2(str(local_file), str(drive_path))
+
+            _set_state(idx, done=True, ok=True, raw='')
+            return url, 'ok'
+
+        except Exception as e:
+            _set_state(idx, done=True, ok=False, raw='')
+            return url, 'error'
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(_worker, idx, url, fp, fn)
+            for idx, (url, fp, fn) in enumerate(items)
+        ]
+        for f in as_completed(futures):
+            url, status = f.result()
+            results[url] = status
+
+    _stop_render.set()
+    renderer.join(timeout=2)
+
+    ok  = sum(1 for s in results.values() if s == 'ok')
+    err = sum(1 for s in results.values() if s == 'error')
+    print(f'\n{CYAN}▶ Batch complete — {GREEN}{ok} ok{RESET}, {RED}{err} error(s){RESET}\n')
+    return results
+
+# ─── IPython magic: %pull ─────────────────────────────────────────────────
 @register_line_magic
 def pull(line):
     inputs = line.split()
@@ -787,11 +874,10 @@ def pull(line):
         f"\n{'':>2}{'into':<4} : {despath}",
         end=''
     )
-
     if branch: print(f"\n{'':>2}{'branch':<4} : {branch}")
     print('\n')
 
-    fp = Path(despath).expanduser()
+    fp   = Path(despath).expanduser()
     opts = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'check': True}
     cmd1 = f'git clone -n --depth=1 --filter=tree:0'
     if branch: cmd1 += f' --branch {branch}'
@@ -806,7 +892,7 @@ def pull(line):
     cmd3 = 'git checkout'
     subs(shlex.split(cmd3), cwd=str(repofold), **opts)
 
-    zipin = repofold / 'config' / tarfold
+    zipin  = repofold / 'config' / tarfold
     zipout = fp / f'{tarfold}.zip'
     with zipfile.ZipFile(str(zipout), 'w') as zipf:
         for root in zipin.rglob('*'):
@@ -821,6 +907,7 @@ def pull(line):
     cmd5 = f'rm -rf {str(repofold)}'
     subs(shlex.split(cmd5), cwd=str(fp), **opts)
 
+# ─── IPython magic: %tempe ────────────────────────────────────────────────
 @register_line_magic
 def tempe(line=''):
     try:
@@ -830,20 +917,10 @@ def tempe(line=''):
         TMP = Path('/tmp')
 
     DIRS = [
-        'ckpt',
-        'lora',
-        'controlnet',
-        'svd',
-        'z123',
-        'clip',
-        'clip_vision',
-        'diffusers',
-        'diffusion_models',
-        'text_encoders',
-        'unet'
+        'ckpt', 'lora', 'controlnet', 'svd', 'z123',
+        'clip', 'clip_vision', 'diffusers', 'diffusion_models',
+        'text_encoders', 'unet'
     ]
 
-    for SUB in DIRS: Path(f'{TMP}/{SUB}').mkdir(parents=True, exist_ok=True)
-
-
-
+    for SUB in DIRS:
+        Path(f'{TMP}/{SUB}').mkdir(parents=True, exist_ok=True)

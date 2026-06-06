@@ -1,4 +1,4 @@
-﻿from IPython.display import display, HTML, clear_output, Image
+from IPython.display import display, HTML, clear_output, Image
 from IPython import get_ipython
 from ipywidgets import widgets
 from pathlib import Path
@@ -15,7 +15,7 @@ key_file = src / 'api-key.json'
 img = src / 'loading.png'
 
 R = '\033[0m'
-T = f'â–¶{R}'
+T = f'▶{R}'
 BLUE = f'\033[38;5;33m{T}'
 CYAN = f'\033[36m{T}'
 PURPLE = f'\033[38;5;135m{T}'
@@ -150,15 +150,15 @@ def KeyCheck():
         KeyWidget()
 
 def CondaMisc():
+    SMF_RAW = 'https://github.com/N3iKos/SMFactory/raw/main'
     for scr in [
-        f'curl -sLo {css} https://github.com/N3iKos/SMFactory/raw/main/script/SM/segsmaker.css',
-        f'curl -sLo {startup}/00-startup.py https://github.com/N3iKos/SMFactory/raw/main/script/SM/00-startup.py',
-        f'curl -sLo {startup}/util.py https://github.com/N3iKos/SMFactory/raw/main/script/SM/util.py',
-        f'curl -sLo {img} https://github.com/N3iKos/SMFactory/raw/main/script/loading.png',
-        f'curl -sLo {startup}/cupang.py https://github.com/N3iKos/SMFactory/raw/main/script/cupang.py'
+        f'curl -sLo {css} {SMF_RAW}/script/SM/segsmaker.css',
+        f'curl -sLo {startup}/00-startup.py {SMF_RAW}/script/SM/00-startup.py',
+        f'curl -sLo {startup}/util.py {SMF_RAW}/script/SM/util.py',
+        f'curl -sLo {img} {SMF_RAW}/script/loading.png',
+        f'curl -sLo {startup}/cupang.py {SMF_RAW}/script/cupang.py'
     ]: SyS(scr)
 
 CondaMisc()
 LoadCSS()
 KeyCheck()
-

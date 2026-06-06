@@ -1,8 +1,10 @@
-﻿from IPython.display import display, Image, clear_output
+from IPython.display import display, Image, clear_output
 from IPython import get_ipython
 from ipywidgets import widgets
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import subprocess
+import threading
 import argparse
 import shlex
 import json
@@ -10,27 +12,29 @@ import sys
 import os
 import re
 
-CD = os.chdir
+CD   = os.chdir
 iRON = os.environ
-SyS = get_ipython().system
+SyS  = get_ipython().system
 
 REPO = {
-    'A1111': 'https://github.com/gutris1/A1111',
-    'Forge': 'https://github.com/lllyasviel/stable-diffusion-webui-forge Forge',
-    'ReForge': 'https://github.com/Panchovix/stable-diffusion-webui-reForge ReForge',
-    'ReForge-old': '-b main-old https://github.com/Panchovix/stable-diffusion-webui-reForge ReForge-old',
-    'Forge-Classic': '-b classic https://github.com/Haoming02/sd-webui-forge-classic Forge-Classic',
-    'Forge-Neo': '-b neo https://github.com/Haoming02/sd-webui-forge-classic Forge-Neo',
-    'ComfyUI': 'https://github.com/comfyanonymous/ComfyUI',
-    'SwarmUI': 'https://github.com/mcmonkeyprojects/SwarmUI'
+    'A1111':        'https://github.com/gutris1/A1111',
+    'Forge':        'https://github.com/lllyasviel/stable-diffusion-webui-forge Forge',
+    'ReForge':      'https://github.com/Panchovix/stable-diffusion-webui-reForge ReForge',
+    'ReForge-old':  '-b main-old https://github.com/Panchovix/stable-diffusion-webui-reForge ReForge-old',
+    'Forge-Classic':'-b classic https://github.com/Haoming02/sd-webui-forge-classic Forge-Classic',
+    'Forge-Neo':    '-b neo https://github.com/Haoming02/sd-webui-forge-classic Forge-Neo',
+    'ComfyUI':      'https://github.com/comfyanonymous/ComfyUI',
+    'SwarmUI':      'https://github.com/mcmonkeyprojects/SwarmUI'
 }
 
 WEBUI_LIST = ['A1111', 'Forge', 'ReForge', 'ReForge-old', 'Forge-Classic', 'Forge-Neo', 'ComfyUI', 'SwarmUI']
 
+SMF_RAW = 'https://github.com/N3iKos/SMFactory/raw/main'
+
 def getENV():
     env = {
-        'Colab': ('/content', '/content', 'COLAB_JUPYTER_TOKEN'),
-        'Kaggle': ('/kaggle', '/kaggle/working', 'KAGGLE_DATA_PROXY_TOKEN')
+        'Colab':  ('/content',        '/content',        'COLAB_JUPYTER_TOKEN'),
+        'Kaggle': ('/kaggle',          '/kaggle/working', 'KAGGLE_DATA_PROXY_TOKEN')
     }
     for name, (base, home, var) in env.items():
         if var in iRON: return name, base, home
@@ -38,9 +42,9 @@ def getENV():
 
 def getArgs():
     parser = argparse.ArgumentParser(description='WebUI Installer Script for Kaggle and Google Colab')
-    parser.add_argument('--webui', required=True, help='available webui: A1111, Forge, ReForge, ReForge-old, Forge-Classic, Forge-Neo, ComfyUI, SwarmUI')
-    parser.add_argument('--civitai_key', required=True, help='your CivitAI API key')
-    parser.add_argument('--hf_read_token', default=None, help='your Huggingface READ Token (optional)')
+    parser.add_argument('--webui',        required=True, help='Available webui options')
+    parser.add_argument('--civitai_key',  required=True, help='Your CivitAI API key')
+    parser.add_argument('--hf_read_token',default=None,  help='Your Huggingface READ Token (optional)')
 
     args, unknown = parser.parse_known_args()
 
@@ -73,60 +77,54 @@ def getPython():
     global PYV
 
     cs = {
-        'v': '3.13.12',
+        'v':   '3.13.12',
         'url': 'https://huggingface.co/gutris1/webui/resolve/main/env/KC-ComfyUI-SwarmUI-Python31312-Torch2100-cu130.tar.lz4'
     }
 
     c = {
         'default': {
-            'v': '3.10.15',
+            'v':   '3.10.15',
             'url': 'https://huggingface.co/gutris1/webui/resolve/main/env/KC-Python310-Torch260-cu124.tar.lz4'
         },
-
-        'ComfyUI': cs,
-        'SwarmUI': cs,
-
+        'ComfyUI':      cs,
+        'SwarmUI':      cs,
         'ReForge': {
-            'v': '3.12.13',
+            'v':   '3.12.13',
             'url': 'https://huggingface.co/gutris1/webui/resolve/main/env/KC-ReForge-Python31213-Torch2110-cu130.tar.lz4'
         },
-
         'Forge-Classic': {
-            'v': '3.11.13',
+            'v':   '3.11.13',
             'url': 'https://huggingface.co/gutris1/webui/resolve/main/env/KC-FC-Python311-Torch260-cu124.tar.lz4'
         },
-
         'Forge-Neo': {
-            'v': '3.13.12',
+            'v':   '3.13.12',
             'url': 'https://huggingface.co/gutris1/webui/resolve/main/env/KC-FN-Python31312-Torch2120-cu130.tar.lz4'
         }
     }
 
     cfg = c.get(webui, c['default'])
-    v = '.'.join(cfg['v'].split('.')[:2])
+    v   = '.'.join(cfg['v'].split('.')[:2])
     PYV = v
 
     BIN = str(PY / 'bin')
     PKG = str(PY / f'lib/python{v}/site-packages')
-    fn = Path(cfg['url']).name
+    fn  = Path(cfg['url']).name
 
     CD(Path(ENVBASE).parent)
-    print(f"\n{ARROW} installing Python Portable {cfg['v']}")
+    print(f'\n{ARROW} installing Python Portable {cfg["v"]}')
 
     SyS('sudo apt-get -qq -y install aria2 pv lz4 > /dev/null 2>&1')
 
     aria = f'aria2c --console-log-level=error --stderr=true -c -x16 -s16 -k1M -j5 {cfg["url"]} -o {fn}'
-    p = subprocess.Popen(shlex.split(aria), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p    = subprocess.Popen(shlex.split(aria), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     p.wait()
 
     SyS(f'pv {fn} | lz4 -d | tar -xf -')
     Path(f'/{fn}').unlink()
 
     sys.path.insert(0, PKG)
-    if BIN not in iRON['PATH']:
-        iRON['PATH'] = BIN + ':' + iRON['PATH']
-    if PKG not in iRON['PYTHONPATH']:
-        iRON['PYTHONPATH'] = PKG + ':' + iRON['PYTHONPATH']
+    if BIN not in iRON['PATH']:     iRON['PATH']       = BIN + ':' + iRON['PATH']
+    if PKG not in iRON['PYTHONPATH']: iRON['PYTHONPATH'] = PKG + ':' + iRON['PYTHONPATH']
 
     if ENVNAME == 'Kaggle':
         for cmd in [
@@ -138,9 +136,7 @@ def getPython():
 def marking(p, n, u):
     t = p / n
     v = {'ui': u, 'launch_args': '', 'tunnel': ''}
-
     if not t.exists(): t.write_text(json.dumps(v, indent=4))
-
     d = json.loads(t.read_text())
     d.update(v)
     t.write_text(json.dumps(d, indent=4))
@@ -169,27 +165,78 @@ def install_tunnel():
 
     for n, b in bins.items():
         if b['bin'].exists(): b['bin'].unlink()
-
-        url = b['url']
+        url  = b['url']
         name = Path(url).name
-
         SyS(f'wget -qO {name} {url}')
         SyS(f'tar -xzf {name} -C {USR}')
         SyS(f'rm -f {name}')
 
+def parallel_clone(urls, dest_dir, max_workers=5):
+    """Parallel shallow clone with --depth=1 --recurse-submodules."""
+    if not urls: return
+    dest_dir  = Path(dest_dir)
+    _lock     = threading.Lock()
+
+    RESET_ = '\033[0m'; GREEN_ = '\033[38;5;35m'; RED_ = '\033[31m'
+
+    def _do_clone(entry):
+        entry = entry.strip()
+        if not entry or entry.startswith('#'): return
+        if entry.startswith('git clone '): entry = entry[len('git clone '):].strip()
+
+        parts        = entry.split()
+        repo_url     = parts[0]
+        folder_name  = parts[1] if len(parts) > 1 else None
+        display_name = folder_name if folder_name else repo_url.split('/')[-1].replace('.git', '')
+
+        cmd = ['git', 'clone', '--depth=1', '--recurse-submodules', '--quiet', repo_url]
+        if folder_name: cmd.append(folder_name)
+
+        try:
+            r = subprocess.run(cmd, cwd=str(dest_dir), capture_output=True, text=True)
+            with _lock:
+                if r.returncode == 0:
+                    print(f'  {GREEN_}✓{RESET_} {display_name}')
+                else:
+                    r2 = subprocess.run(
+                        ['git', 'clone', '--recurse-submodules', '--quiet', repo_url] +
+                        ([folder_name] if folder_name else []),
+                        cwd=str(dest_dir), capture_output=True, text=True
+                    )
+                    if r2.returncode == 0:
+                        print(f'  {GREEN_}✓{RESET_} {display_name}')
+                    else:
+                        print(f'  {RED_}✗{RESET_} {display_name}: {r2.stderr.strip()[:120]}')
+        except Exception as e:
+            with _lock:
+                print(f'  {RED_}✗{RESET_} {display_name}: {e}')
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool.map(_do_clone, urls)
+
+def parallel_download_list(items, max_workers=4):
+    """Fan out download() calls concurrently (for setup/upscalers)."""
+    if not items: return
+
+    def _do(item):
+        try:
+            get_ipython().run_line_magic('download', item)
+        except Exception as e:
+            print(f'  download error: {e}')
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool.map(_do, items)
+
 def sym_link(U, M):
     configs = {
         'A1111': {
-            'sym': [
-                f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'} {TMP}/*"
-            ],
+            'sym': [f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'} {TMP}/*"],
             'links': [
                 (TMP / 'ckpt', M / 'Stable-diffusion/tmp_ckpt'),
                 (TMP / 'lora', M / 'Lora/tmp_lora'),
                 (TMP / 'controlnet', M / 'ControlNet')
             ]
         },
-
         'Forge': {
             'sym': [
                 f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'}",
@@ -210,7 +257,6 @@ def sym_link(U, M):
                 (TMP / 'unet', M / 'unet')
             ]
         },
-
         'ReForge': {
             'sym': [
                 f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'}",
@@ -224,7 +270,6 @@ def sym_link(U, M):
                 (TMP / 'svd', M / 'svd')
             ]
         },
-
         'ReForge-old': {
             'sym': [
                 f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'}",
@@ -238,29 +283,22 @@ def sym_link(U, M):
                 (TMP / 'svd', M / 'svd')
             ]
         },
-
         'Forge-Classic': {
-            'sym': [
-                f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'}"
-            ],
+            'sym': [f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'}"],
             'links': [
                 (TMP / 'ckpt', M / 'Stable-diffusion/tmp_ckpt'),
                 (TMP / 'lora', M / 'Lora/tmp_lora'),
                 (TMP / 'controlnet', M / 'ControlNet')
             ]
         },
-
         'Forge-Neo': {
-            'sym': [
-                f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'}"
-            ],
+            'sym': [f"rm -rf {M / 'Stable-diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'ControlNet'}"],
             'links': [
                 (TMP / 'ckpt', M / 'Stable-diffusion/tmp_ckpt'),
                 (TMP / 'lora', M / 'Lora/tmp_lora'),
                 (TMP / 'controlnet', M / 'ControlNet')
             ]
         },
-
         'ComfyUI': {
             'sym': [
                 f"rm -rf {M / 'checkpoints/tmp_ckpt'} {M / 'loras/tmp_lora'} {M / 'controlnet'}",
@@ -279,7 +317,6 @@ def sym_link(U, M):
                 (TMP / 'unet', M / 'unet')
             ]
         },
-
         'SwarmUI': {
             'sym': [
                 f"rm -rf {M / 'Stable-Diffusion/tmp_ckpt'} {M / 'Lora/tmp_lora'} {M / 'controlnet'}",
@@ -297,7 +334,8 @@ def sym_link(U, M):
 
     cfg = configs.get(U)
     [SyS(f'{cmd}') for cmd in cfg['sym']]
-    if U not in ['ComfyUI', 'SwarmUI']: [(M / d).mkdir(parents=True, exist_ok=True) for d in ['Lora', 'ESRGAN']]
+    if U not in ['ComfyUI', 'SwarmUI']:
+        [(M / d).mkdir(parents=True, exist_ok=True) for d in ['Lora', 'ESRGAN']]
     [SyS(f'ln -s {src} {tg}') for src, tg in cfg['links']]
 
 def webui_req(U, W, M):
@@ -309,7 +347,6 @@ def webui_req(U, W, M):
         M.mkdir(parents=True, exist_ok=True)
         for sub in ['Stable-Diffusion', 'Lora', 'Embeddings', 'VAE', 'upscale_models']:
             (M / sub).mkdir(parents=True, exist_ok=True)
-
         download(f'https://dot.net/v1/dotnet-install.sh {W}')
         dotnet = W / 'dotnet-install.sh'
         dotnet.chmod(0o755)
@@ -318,15 +355,16 @@ def webui_req(U, W, M):
     sym_link(U, M)
     install_tunnel()
 
+    # Scripts (small — sequential is fine)
     scripts = [
-        f'https://github.com/N3iKos/SMFactory/raw/main/script/controlnet.py {W}/asd',
-        f'https://github.com/N3iKos/SMFactory/raw/main/script/cn15.py {W}/asd',
-        f'https://github.com/N3iKos/SMFactory/raw/main/script/cnxl.py {W}/asd',
-        f'https://github.com/N3iKos/SMFactory/raw/main/script/KC/segsmaker.py {W}'
+        f'{SMF_RAW}/script/controlnet.py {W}/asd',
+        f'{SMF_RAW}/script/cn15.py {W}/asd',
+        f'{SMF_RAW}/script/cnxl.py {W}/asd',
+        f'{SMF_RAW}/script/KC/segsmaker.py {W}'
     ]
+    for item in scripts: download(item)
 
     u = M / 'upscale_models' if U in ['ComfyUI', 'SwarmUI'] else M / 'ESRGAN'
-
     upscalers = [
         f'https://huggingface.co/gutris1/webui/resolve/main/misc/4x-UltraSharp.pth {u}',
         f'https://huggingface.co/gutris1/webui/resolve/main/misc/4x-AnimeSharp.pth {u}',
@@ -339,43 +377,67 @@ def webui_req(U, W, M):
         f'https://huggingface.co/subby2006/NMKD-UltraYandere/resolve/main/4x_NMKD-UltraYandere_300k.pth {u}'
     ]
 
-    line = scripts + upscalers
-    for item in line: download(item)
+    # Fire upscaler downloads in background — large but not needed until runtime
+    def _bg_upscalers():
+        parallel_download_list(upscalers, max_workers=4)
+
+    bg = threading.Thread(target=_bg_upscalers, daemon=True, name='upscaler-bg')
+    bg.start()
+    webui_req._upscaler_thread = bg
 
     if U not in ['SwarmUI', 'ComfyUI']:
         e = 'jpg' if U in ['Forge-Classic', 'Forge-Neo'] else 'png'
         SyS(f'rm -f {W}/html/card-no-preview.{e}')
-
         for ass in [
             f'https://huggingface.co/gutris1/webui/resolve/main/misc/card-no-preview.png {W}/html card-no-preview.{e}',
-            f'https://github.com/N3iKos/SMFactory/raw/main/config/NoCrypt_miku.json {W}/tmp/gradio_themes',
-            f'https://github.com/N3iKos/SMFactory/raw/main/config/user.css {W} user.css'
+            f'{SMF_RAW}/config/NoCrypt_miku.json {W}/tmp/gradio_themes',
+            f'{SMF_RAW}/config/user.css {W} user.css'
         ]: download(ass)
-
-        if U not in ['Forge', 'Forge-Neo']: download(f'https://github.com/N3iKos/SMFactory/raw/main/config/config.json {W} config.json')
+        if U not in ['Forge', 'Forge-Neo']:
+            download(f'{SMF_RAW}/config/config.json {W} config.json')
 
 def webui_extension(U, W, M):
     EXT = W / 'custom_nodes' if U == 'ComfyUI' else W / 'extensions'
     CD(EXT)
 
     if U == 'ComfyUI':
-        say('<br><b>ã€{red} Installing Custom Nodes{d} ã€‘{red}</b>')
-        clone(str(W / 'asd/custom_nodes.txt'))
+        say('<br><b>【{red} Installing Custom Nodes{d} 】{red}</b>')
+        node_list_path = W / 'asd/custom_nodes.txt'
+        if node_list_path.exists():
+            node_urls = [
+                line.strip() for line in node_list_path.read_text().splitlines()
+                if line.strip() and not line.strip().startswith('#')
+            ]
+            parallel_clone(node_urls, EXT, max_workers=5)
+        else:
+            clone(str(node_list_path))
         print()
-
         for faces in [
             f'https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth {M}/facerestore_models',
             f'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth {M}/facerestore_models'
         ]: download(faces)
 
     else:
-        say('<br><b>ã€{red} Installing Extensions{d} ã€‘{red}</b>')
-        clone(str(W / 'asd/extension.txt'))
-        if ENVNAME == 'Kaggle': clone('https://github.com/gutris1/sd-image-encryption')
+        say('<br><b>【{red} Installing Extensions{d} 】{red}</b>')
+        ext_list_path = W / 'asd/extension.txt'
+        if ext_list_path.exists():
+            ext_urls = [
+                line.strip() for line in ext_list_path.read_text().splitlines()
+                if line.strip() and not line.strip().startswith('#')
+            ]
+            parallel_clone(ext_urls, EXT, max_workers=5)
+        else:
+            clone(str(ext_list_path))
+        if ENVNAME == 'Kaggle':
+            clone('https://github.com/gutris1/sd-image-encryption')
 
 def webui_installation(U, W):
     M = W / 'Models' if U == 'SwarmUI' else W / 'models'
-    E = M / 'Embeddings' if U == 'SwarmUI' else (M / 'embeddings' if U in ['Forge-Classic', 'Forge-Neo', 'ComfyUI'] else W / 'embeddings')
+    E = (
+        M / 'Embeddings' if U == 'SwarmUI'
+        else M / 'embeddings' if U in ['Forge-Classic', 'Forge-Neo', 'ComfyUI']
+        else W / 'embeddings'
+    )
     V = M / 'vae' if U == 'ComfyUI' else M / 'VAE'
 
     webui_req(U, W, M)
@@ -384,42 +446,40 @@ def webui_installation(U, W):
         f'https://huggingface.co/gutris1/webui/resolve/main/misc/embeddingsXL.zip {W}',
         f'https://huggingface.co/madebyollin/sdxl-vae-fp16-fix/resolve/main/sdxl.vae.safetensors {V} sdxl_vae.safetensors'
     ]
-
     for i in extras: download(i)
     SyS(f"unzip -qo {W / 'embeddingsXL.zip'} -d {E} && rm {W / 'embeddingsXL.zip'}")
 
     if U != 'SwarmUI': webui_extension(U, W, M)
 
+    # Join background upscaler thread
+    bg = getattr(webui_req, '_upscaler_thread', None)
+    if bg and bg.is_alive():
+        print(f'\n  Waiting for upscaler downloads to finish…')
+        bg.join()
+        print(f'  ✓ Upscalers ready.\n')
+
 def webui_selection(ui):
     with output:
         output.clear_output(wait=True)
-
         if ui in REPO: (WEBUI, repo) = (HOME / ui, REPO[ui])
-        say(f'<b>ã€{{red}} Installing {WEBUI.name}{{d}} ã€‘{{red}}</b>')
+        say(f'<b>【{{red}} Installing {WEBUI.name}{{d}} 】{{red}}</b>')
         clone(repo)
-
         webui_installation(ui, WEBUI)
-
         with loading:
             loading.clear_output(wait=True)
-            say('<br><b>ã€{red} Done{d} ã€‘{red}</b>')
+            say('<br><b>【{red} Done{d} 】{red}</b>')
             tempe()
             CD(HOME)
 
 def webui_installer():
     branchs = {
-        'A1111': 'master',
-        'ComfyUI': 'master',
-        'SwarmUI': 'master',
-        'Forge': 'main',
-        'ReForge': 'main',
-        'ReForge-old': 'main-old',
-        'Forge-Classic': 'classic',
-        'Forge-Neo': 'neo',
+        'A1111':        'master', 'ComfyUI': 'master', 'SwarmUI': 'master',
+        'Forge':        'main',   'ReForge':  'main',
+        'ReForge-old':  'main-old',
+        'Forge-Classic':'classic', 'Forge-Neo': 'neo',
     }
-
     CD(HOME)
-    ui = (json.load(MARKED.open('r')) if MARKED.exists() else {}).get('ui')
+    ui    = (json.load(MARKED.open('r')) if MARKED.exists() else {}).get('ui')
     WEBUI = HOME / ui if ui else None
 
     if WEBUI is not None and WEBUI.exists():
@@ -442,23 +502,21 @@ def webui_installer():
 
 def notebook_scripts():
     z = [
-        (STR / '00-startup.py', f'wget -qO {STR}/00-startup.py https://github.com/N3iKos/SMFactory/raw/main/script/KC/00-startup.py'),
-        (nenen, f'wget -qO {nenen} https://github.com/N3iKos/SMFactory/raw/main/script/nenen88.py'),
-        (melon, f'wget -qO {melon} https://github.com/N3iKos/SMFactory/raw/main/script/melon00.py'),
-        (STR / 'cupang.py', f'wget -qO {STR}/cupang.py https://github.com/N3iKos/SMFactory/raw/main/script/cupang.py'),
-        (MRK, f'wget -qO {MRK} https://github.com/N3iKos/SMFactory/raw/main/script/marking.py')
+        (STR / '00-startup.py', f'wget -qO {STR}/00-startup.py {SMF_RAW}/script/KC/00-startup.py'),
+        (nenen,                  f'wget -qO {nenen} {SMF_RAW}/script/nenen88.py'),
+        (melon,                  f'wget -qO {melon} {SMF_RAW}/script/melon00.py'),
+        (STR / 'cupang.py',      f'wget -qO {STR}/cupang.py {SMF_RAW}/script/cupang.py'),
+        (MRK,                    f'wget -qO {MRK} {SMF_RAW}/script/marking.py')
     ]
-
     [SyS(y) for x, y in z if not Path(x).exists()]
 
     j = {
-        'ENVNAME': ENVNAME,
+        'ENVNAME':  ENVNAME,
         'HOMEPATH': HOME,
         'TEMPPATH': TMP,
         'BASEPATH': Path(ENVBASE),
-        'PYV': PYV
+        'PYV':      PYV
     }
-
     text = '\n'.join(f"{k} = '{v}'" for k, v in j.items())
     Path(KANDANG).write_text(text)
 
@@ -466,8 +524,10 @@ def notebook_scripts():
     marking(SRC, MARKED, webui)
     sys.path.append(str(STR))
 
-    for scripts in [nenen, melon, KANDANG, MRK]: get_ipython().run_line_magic('run', str(scripts))
+    for scripts in [nenen, melon, KANDANG, MRK]:
+        get_ipython().run_line_magic('run', str(scripts))
 
+# ── Bootstrap ──────────────────────────────────────────────────────────────
 ENVNAME, ENVBASE, ENVHOME = getENV()
 PYV = None
 
@@ -475,33 +535,33 @@ if not ENVNAME:
     print('You are not in Kaggle or Google Colab.\nExiting.')
     sys.exit()
 
-RESET = '\033[0m'
-RED = '\033[31m'
-PURPLE = '\033[38;5;135m'
-ORANGE = '\033[38;5;208m'
-ARROW = f'{ORANGE}â–¶{RESET}'
-ERROR = f'{PURPLE}[{RESET}{RED}ERROR{RESET}{PURPLE}]{RESET}'
-IMG = 'https://github.com/N3iKos/SMFactory/raw/main/script/loading.png'
+RESET_  = '\033[0m'
+RED_    = '\033[31m'
+GREEN_  = '\033[38;5;35m'
+YELLOW_ = '\033[33m'
+PURPLE_ = '\033[38;5;135m'
+ORANGE_ = '\033[38;5;208m'
+ARROW   = f'{ORANGE_}▶{RESET_}'
+ERROR   = f'{PURPLE_}[{RESET_}{RED_}ERROR{RESET_}{PURPLE_}]{RESET_}'
+IMG     = f'{SMF_RAW}/script/loading.png'
 
-HOME = Path(ENVHOME)
-TMP = Path(ENVBASE) / 'temp'
-
-PY = Path('/GUTRIS1')
-SRC = HOME / 'gutris1'
-MRK = SRC / 'marking.py'
-KEY = SRC / 'api-key.json'
-MARKED = SRC / 'marking.json'
-
-USR = Path('/usr/bin')
-STR = Path('/root/.ipython/profile_default/startup')
-nenen = STR / 'nenen88.py'
-melon = STR / 'melon00.py'
+HOME    = Path(ENVHOME)
+TMP     = Path(ENVBASE) / 'temp'
+PY      = Path('/GUTRIS1')
+SRC     = HOME / 'gutris1'
+MRK     = SRC / 'marking.py'
+KEY     = SRC / 'api-key.json'
+MARKED  = SRC / 'marking.json'
+USR     = Path('/usr/bin')
+STR     = Path('/root/.ipython/profile_default/startup')
+nenen   = STR / 'nenen88.py'
+melon   = STR / 'melon00.py'
 KANDANG = STR / 'KANDANG.py'
 
 TMP.mkdir(parents=True, exist_ok=True)
 SRC.mkdir(parents=True, exist_ok=True)
 
-output = widgets.Output()
+output  = widgets.Output()
 loading = widgets.Output()
 
 webui, civitai_key, hf_read_token = getArgs()
@@ -509,9 +569,8 @@ if civitai_key is None: sys.exit()
 
 display(output, loading)
 with loading: display(Image(url=IMG))
-with output: PY.exists() or getPython()
+with output:  PY.exists() or getPython()
 notebook_scripts()
 
 from nenen88 import clone, say, download, tempe, pull
 webui_installer()
-

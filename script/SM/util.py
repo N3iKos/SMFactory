@@ -1,4 +1,4 @@
-﻿from IPython.core.magic import register_line_magic, register_cell_magic
+from IPython.core.magic import register_line_magic, register_cell_magic
 from IPython.display import display, HTML, clear_output, Image
 from IPython import get_ipython
 import ipywidgets as widgets
@@ -271,7 +271,7 @@ def zipping(line, cell):
             total=len(all_files),
             desc='zipping : ',
             bar_format='{desc}[{bar:26}] [{n_fmt}/{total_fmt}]',
-            ascii='â–·â–¶',
+            ascii='▷▶',
             file=sys.stdout) as pbar:
 
             with zipfile.ZipFile(
